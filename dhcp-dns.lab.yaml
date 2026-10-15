@@ -1,0 +1,286 @@
+# DHCP and DNS with dnsmasq
+# A server and two clients are network namespaces in this one VM. The clients have no address;
+# the student configures dnsmasq so the server leases them one and answers for the lab's names.
+# Everything is installed by the setup below, from Ubuntu's archive, the first time it starts.
+cpus: 1
+memory: 1024    # MB
+disk: 10        # GB
+
+# Nothing opens in the browser: the lab is the terminal.
+open: []
+
+# Run once, as root. Its output is kept in /var/log/mitsurutech-setup.log on the VM.
+setup: |
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq dnsmasq isc-dhcp-client bind9-dnsutils iproute2 iputils-ping tcpdump
+  # The package's own service would listen on the VM's own port 53; the lab runs dnsmasq in a namespace.
+  systemctl disable --now dnsmasq >/dev/null 2>&1
+  mkdir -p /etc/netlab /etc/dnsmasq.d /usr/local/lib
+  cat > /etc/netlab/dnsmasq.base <<'DNSLAB_BASE_END'
+  interface=br0
+  bind-interfaces
+  no-hosts
+  user=root
+  pid-file=/run/dnslab/dnsmasq.pid
+  dhcp-leasefile=/run/dnslab/dnsmasq.leases
+  log-facility=/var/log/dnslab-dnsmasq.log
+  conf-dir=/etc/dnsmasq.d/,*.conf
+  DNSLAB_BASE_END
+  cat > /etc/netlab/dhclient.conf <<'DNSLAB_DHC_END'
+  timeout 12;
+  initial-interval 1;
+  DNSLAB_DHC_END
+  cat > /usr/local/lib/dnslab-script <<'DNSLAB_SCRIPT_END'
+  #!/bin/sh
+  # dhclient calls this with the lease in new_* variables. A namespace has no systemd and no
+  # resolvconf, so it does the three things itself: the address, the default route, resolv.conf.
+  case "$reason" in
+  BOUND|RENEW|REBIND|REBOOT)
+    ip addr flush dev "$interface"
+    ip addr add "$new_ip_address/$new_subnet_mask" dev "$interface"
+    set -- $new_routers
+    [ -n "$1" ] && ip route replace default via "$1"
+    : > /etc/resolv.conf
+    for s in $new_domain_name_servers; do echo "nameserver $s" >> /etc/resolv.conf; done ;;
+  esac
+  exit 0
+  DNSLAB_SCRIPT_END
+  chmod 755 /usr/local/lib/dnslab-script
+  cat > /usr/local/bin/dnslab <<'DNSLAB_TOOL_END'
+  #!/bin/bash
+  # dnslab: a server and two clients as network namespaces in this VM.
+  #   dnslab status | restart | renew [pc1|pc2] | shell <server|pc1|pc2> | up | down
+  # restart runs dnsmasq again from /etc/dnsmasq.d/*.conf; renew makes a client ask for a lease.
+  [ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
+  BASE=/etc/netlab/dnsmasq.base
+  LOG=/var/log/dnslab-dnsmasq.log
+
+  stop_dnsmasq() {
+    pkill -x dnsmasq
+    for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -x dnsmasq >/dev/null || return 0; sleep 0.5; done
+    pkill -9 -x dnsmasq; sleep 0.5
+  }
+
+  start_dnsmasq() {
+    stop_dnsmasq
+    mkdir -p /run/dnslab; rm -f /run/dnslab/dnsmasq.leases
+    out=$(ip netns exec server dnsmasq -C $BASE --test 2>&1) || {
+      echo "dnslab: dnsmasq does not accept its configuration:"; echo "$out"; return 1; }
+    ip netns exec server dnsmasq -C $BASE && echo "dnslab: dnsmasq is running, started from /etc/dnsmasq.d"
+  }
+
+  renew() {
+    list="$*"; [ -n "$list" ] || list="pc1 pc2"
+    for p in $list; do
+      ip netns list | grep -qw $p || { echo "dnslab: no client $p"; return 1; }
+      pkill -f "dhclient.*$p.pid"
+      ip -n $p addr flush dev eth0
+      : > /etc/netns/$p/resolv.conf
+      echo "== $p asks for an address"
+      ip netns exec $p dhclient -1 -v -cf /etc/netlab/dhclient.conf -lf /run/dnslab/$p.dhl -pf /run/dnslab/$p.pid \
+        -sf /usr/local/lib/dnslab-script eth0 2>&1 | grep -E 'DHCP|bound|No '
+    done
+  }
+
+  up() {
+    if ip netns list | grep -qw server; then echo "dnslab: already up (dnslab restart runs dnsmasq again)"; return 1; fi
+    mkdir -p /run/dnslab /etc/netns/server /etc/netns/pc1 /etc/netns/pc2
+    for n in server pc1 pc2; do ip netns add $n; ip -n $n link set lo up; done
+    # A resolver that is not there: this VM has no way out, so nothing is forwarded for real.
+    echo "nameserver 192.0.2.53" > /etc/netns/server/resolv.conf
+    ip -n server link add br0 type bridge
+    ip -n server addr add 10.0.10.1/24 dev br0
+    ip -n server link set br0 up
+    for p in pc1 pc2; do
+      : > /etc/netns/$p/resolv.conf
+      ip link add sv-$p netns server type veth peer name eth0 netns $p address 02:00:00:00:00:0$(echo $p | tr -d pc)
+      ip -n server link set sv-$p master br0 up
+      ip -n $p link set eth0 up
+    done
+    start_dnsmasq
+    (renew pc1; renew pc2) > /var/log/dnslab.log 2>&1 &
+    echo "dnslab: up: server pc1 pc2"
+  }
+
+  down() {
+    pkill dhclient; stop_dnsmasq
+    for n in server pc1 pc2; do ip netns del $n 2>/dev/null; done
+  }
+
+  status() {
+    ip netns list | grep -qw server || { echo "dnslab: not up (dnslab up)"; exit 1; }
+    for n in server pc1 pc2; do
+      echo "$n"
+      ip -n $n -br -4 addr show | grep -v '^lo ' | sed 's/^/  /'
+      ip -n $n route show default | sed 's/^/  route: /'
+      [ $n = server ] || sed 's/^/  resolv.conf: /' /etc/netns/$n/resolv.conf
+    done
+    pgrep -x dnsmasq >/dev/null && echo "dnsmasq: running" || echo "dnsmasq: not running"
+  }
+
+  case "$1" in
+    up) up ;;
+    down) down ;;
+    restart) start_dnsmasq ;;
+    renew) shift; renew "$@" ;;
+    status|"") status ;;
+    shell) ip netns list | grep -qw "$2" || { echo "dnslab: no node $2"; exit 1; }
+           printf "PS1='%s# '\n" "$2" > /run/dnslab/$2.rc
+           exec ip netns exec "$2" bash --rcfile /run/dnslab/$2.rc -i ;;
+    *) sed -n 2,4p "$0"; exit 1 ;;
+  esac
+  DNSLAB_TOOL_END
+  chmod 755 /usr/local/bin/dnslab
+  [ -e /etc/dnsmasq.d/lab.conf ] || cat > /etc/dnsmasq.d/lab.conf <<'DNSLAB_STARTER_END'
+  # Your dnsmasq configuration for the lab goes here, then: sudo dnslab restart
+  # The rest of what dnsmasq needs (the interface, where leases are kept) is already set.
+  # man dnsmasq lists every option.
+  DNSLAB_STARTER_END
+  cat > /etc/systemd/system/dnslab.service <<'DNSLAB_UNIT_END'
+  [Unit]
+  Description=DHCP and DNS lab: a server and two clients as namespaces
+  After=network.target
+
+  [Service]
+  Type=oneshot
+  RemainAfterExit=yes
+  ExecStart=/usr/local/bin/dnslab up
+  ExecStop=/usr/local/bin/dnslab down
+
+  [Install]
+  WantedBy=multi-user.target
+  DNSLAB_UNIT_END
+  systemctl daemon-reload
+  systemctl enable dnslab >/dev/null 2>&1
+  home=/home/student
+  [ -d $home ] || home=/root
+  cat > $home/README.md <<'DNSLAB_README_END'
+  # Lab: DHCP and DNS with dnsmasq
+
+  Three machines, built in this VM as network namespaces on one switch:
+
+      server (10.0.10.1) ---+--- pc1
+                            +--- pc2
+
+  pc1 and pc2 start with no address at all. The server runs dnsmasq, but nothing is configured:
+  it hands out no leases and answers no names. There is no internet, so nothing is forwarded.
+
+  | machine | hardware address  |
+  |---------|-------------------|
+  | pc1     | 02:00:00:00:00:01 |
+  | pc2     | 02:00:00:00:00:02 |
+
+  ## What to do
+
+  1. Look at the machines with dnslab status. Try to get pc1 an address with
+     dnslab renew pc1 and watch it fail. tcpdump in the server (dnslab shell server) shows what
+     the client is broadcasting.
+  2. Write the configuration in /etc/dnsmasq.d/lab.conf (the file is there, empty). It must make
+     the server:
+     - hand out leases from 10.0.10.100 to 10.0.10.150, for 12 hours;
+     - tell clients that their router is 10.0.10.254 and their DNS server is 10.0.10.1;
+     - always give pc2 the address 10.0.10.50, by its hardware address;
+     - answer files.lab with 10.0.10.20 and printer.lab with 10.0.10.30;
+     - forward nothing else: any other name is refused or not found, never answered.
+  3. Run sudo dnslab restart. It tells you if dnsmasq does not like the file. Then dnslab renew
+     and look at what each client got: the address, the route, resolv.conf.
+  4. From a client, look the names up (dig files.lab, dig @10.0.10.1 printer.lab) and
+     try a name that is not yours (www.example.com).
+  5. The names and the leases must come from the saved file and nothing else. The check starts
+     dnsmasq again from /etc/dnsmasq.d, wipes both clients and has them ask again.
+
+  ## The tools
+
+  - dnslab status             every machine, its address, route and resolver
+  - dnslab restart            run dnsmasq again from /etc/dnsmasq.d/*.conf
+  - dnslab renew [pc1|pc2]    the client asks for a lease (dhclient)
+  - dnslab shell pc1          a shell inside a machine (also server)
+  - sudo ip netns exec pc1 dig @10.0.10.1 files.lab    what the shell does, by hand
+  - man dnsmasq               every option
+  DNSLAB_README_END
+  chown student:student $home/README.md 2>/dev/null
+  echo "Read README.md in your home folder first." > /etc/motd
+  systemctl start dnslab 2>/dev/null || dnslab up
+
+# Marks a handed-in VM, KAN-29: run as root on a copy of the saved disk after a fresh boot, so
+# it sees only what was saved. Its exit status is the result: 0 passes.
+check: |
+  fail() {
+    echo "NOT PASSED: $*"
+    echo "--- dnsmasq log"; tail -6 /var/log/dnslab-dnsmasq.log 2>&1
+    exit 1
+  }
+  for i in $(seq 1 30); do ip netns list | grep -qw server && break; sleep 2; done
+  ip netns list | grep -qw server || dnslab up >/dev/null 2>&1
+  for n in server pc1 pc2; do ip netns list | grep -qw $n || fail "the machine $n is missing"; done
+  ip -n server -4 -o addr show dev br0 | grep -q ' 10.0.10.1/24 ' || fail "the server should have 10.0.10.1/24 on br0"
+  [ "$(ip -n server -4 -o addr show | grep -vc ' lo ')" = 1 ] || fail "the server has addresses that were added"
+  ip -n pc1 -o link show eth0 | grep -qi '02:00:00:00:00:01' || fail "pc1's hardware address was changed"
+  ip -n pc2 -o link show eth0 | grep -qi '02:00:00:00:00:02' || fail "pc2's hardware address was changed"
+  ls /etc/dnsmasq.d/*.conf >/dev/null 2>&1 || fail "no configuration was saved in /etc/dnsmasq.d"
+  mkdir -p /run/dnslab
+  cat > /tmp/chk.base <<'CHK_BASE_END'
+  interface=br0
+  bind-interfaces
+  no-hosts
+  user=root
+  pid-file=/run/dnslab/dnsmasq.pid
+  dhcp-leasefile=/run/dnslab/dnsmasq.leases
+  log-facility=/var/log/dnslab-dnsmasq.log
+  conf-dir=/etc/dnsmasq.d/,*.conf
+  CHK_BASE_END
+  cat > /tmp/chk.script <<'CHK_SCRIPT_END'
+  #!/bin/sh
+  # dhclient calls this with the lease in new_* variables. A namespace has no systemd and no
+  # resolvconf, so it does the three things itself: the address, the default route, resolv.conf.
+  case "$reason" in
+  BOUND|RENEW|REBIND|REBOOT)
+    ip addr flush dev "$interface"
+    ip addr add "$new_ip_address/$new_subnet_mask" dev "$interface"
+    set -- $new_routers
+    [ -n "$1" ] && ip route replace default via "$1"
+    : > /etc/resolv.conf
+    for s in $new_domain_name_servers; do echo "nameserver $s" >> /etc/resolv.conf; done ;;
+  esac
+  exit 0
+  CHK_SCRIPT_END
+  chmod +x /tmp/chk.script
+  cat > /tmp/chk.dhc <<'CHK_DHC_END'
+  timeout 12;
+  initial-interval 1;
+  CHK_DHC_END
+  pkill dhclient; pkill -x dnsmasq
+  for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -x dnsmasq >/dev/null || break; sleep 0.5; done
+  pkill -9 -x dnsmasq
+  out=$(ip netns exec server dnsmasq -C /tmp/chk.base --test 2>&1) || fail "dnsmasq does not accept the saved configuration: $out"
+  rm -f /run/dnslab/dnsmasq.leases
+  ip netns exec server dnsmasq -C /tmp/chk.base || fail "dnsmasq did not start from the saved configuration"
+  sleep 1
+  for p in pc1 pc2; do
+    ip -n $p addr flush dev eth0
+    : > /etc/netns/$p/resolv.conf
+    rm -f /tmp/chk-$p.dhl
+    ip netns exec $p dhclient -1 -cf /tmp/chk.dhc -lf /tmp/chk-$p.dhl -pf /tmp/chk-$p.pid -sf /tmp/chk.script eth0 >/tmp/chk-$p.out 2>&1
+    ip -n $p -4 -o addr show dev eth0 | grep -q inet || fail "$p was given no address by dnsmasq: check the DHCP range"
+  done
+  a1=$(ip -n pc1 -4 -o addr show dev eth0 | awk '{print $4}')
+  a2=$(ip -n pc2 -4 -o addr show dev eth0 | awk '{print $4}')
+  ip1=$(echo $a1 | cut -d/ -f1); ip2=$(echo $a2 | cut -d/ -f1)
+  net=$(echo $ip1 | cut -d. -f1-3); last=$(echo $ip1 | cut -d. -f4)
+  [ "$net" = 10.0.10 ] && [ "$last" -ge 100 ] && [ "$last" -le 150 ] || fail "pc1 was given $ip1, which is not in 10.0.10.100 to 10.0.10.150"
+  [ "$ip2" = 10.0.10.50 ] || fail "pc2 was given $ip2, not the fixed address 10.0.10.50 for its hardware address"
+  for p in pc1 pc2; do
+    ip -n $p route show default | grep -q 'via 10.0.10.254 ' || fail "$p's router is not 10.0.10.254: $(ip -n $p route show default)"
+    [ "$(grep -c nameserver /etc/netns/$p/resolv.conf)" = 1 ] && grep -q '^nameserver 10.0.10.1$' /etc/netns/$p/resolv.conf || fail "$p's DNS server is not 10.0.10.1"
+    grep -q 'option dhcp-lease-time 43200;' /tmp/chk-$p.dhl || fail "$p's lease is not for 12 hours"
+  done
+  want() { got=$(ip netns exec $1 dig +time=2 +tries=1 +short A $2 2>&1 | head -1); [ "$got" = "$3" ] || fail "$1 looking up $2 got '$got', not $3"; }
+  for p in pc1 pc2; do want $p files.lab 10.0.10.20; want $p printer.lab 10.0.10.30; done
+  for name in www.example.com nothing-here.lab; do
+    ans=$(ip netns exec pc1 dig @10.0.10.1 +time=2 +tries=1 $name A 2>&1)
+    echo "$ans" | grep -q 'ANSWER: [1-9]' && fail "$name was answered, and only files.lab and printer.lab should be"
+    echo "$ans" | grep -qE 'status: (NXDOMAIN|REFUSED)' || fail "$name should be refused or not found, and the server said: $(echo "$ans" | grep -E 'status|no servers' | head -1)"
+  done
+  pkill dhclient
+  echo "PASSED: dnsmasq started from the saved file leases 10.0.10.100-150 for 12 hours with router 10.0.10.254 and DNS 10.0.10.1, gives pc2 10.0.10.50, answers files.lab and printer.lab and nothing else"

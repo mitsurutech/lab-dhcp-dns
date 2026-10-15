@@ -1,0 +1,21 @@
+name: check
+on:
+  push:
+  pull_request:
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: The lab is valid and inside the platform's limits
+        run: |
+          python3 - <<'PY'
+          import yaml
+          d = yaml.safe_load(open('dhcp-dns.lab.yaml'))
+          for key in ('cpus', 'memory', 'disk', 'setup', 'check'):
+              assert key in d, f'no {key}'
+          for key in ('setup', 'check'):
+              size = len(d[key].encode())
+              assert size <= 16384, f'{key} is {size} bytes, over 16 KB'
+          print('dhcp-dns.lab.yaml ok')
+          PY
