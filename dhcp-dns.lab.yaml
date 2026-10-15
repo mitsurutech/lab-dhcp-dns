@@ -77,9 +77,12 @@ setup: |
       pkill -f "dhclient.*$p.pid"
       ip -n $p addr flush dev eth0
       : > /etc/netns/$p/resolv.conf
-      echo "== $p asks for an address"
-      ip netns exec $p dhclient -1 -v -cf /etc/netlab/dhclient.conf -lf /run/dnslab/$p.dhl -pf /run/dnslab/$p.pid \
-        -sf /usr/local/lib/dnslab-script eth0 2>&1 | grep -E 'DHCP|bound|No '
+      echo "$p asks for an address (tcpdump on the server shows the conversation)"
+      ip netns exec $p dhclient -1 -cf /etc/netlab/dhclient.conf -lf /run/dnslab/$p.dhl -pf /run/dnslab/$p.pid \
+        -sf /usr/local/lib/dnslab-script eth0 >/dev/null 2>&1
+      got=$(ip -n $p -4 -o addr show dev eth0 | awk '{print $4}')
+      if [ -n "$got" ]; then echo "  $p was given $got, router: $(ip -n $p route show default | cut -d' ' -f3), DNS: $(grep nameserver /etc/netns/$p/resolv.conf | cut -d' ' -f2 | tr '\n' ' ')"
+      else echo "  $p was given nothing: no DHCPOFFER came back"; fi
     done
   }
 
