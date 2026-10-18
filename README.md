@@ -1,5 +1,7 @@
 # DHCP and DNS lab with dnsmasq: a networking lab for a classroom, in one VM
 
+[English](README.md) | [Français](README.fr.md) | [日本語](README.ja.md) | [Español](README.es.md)
+
 [![check](https://github.com/mitsurutech/lab-dhcp-dns/actions/workflows/check.yml/badge.svg)](https://github.com/mitsurutech/lab-dhcp-dns/actions/workflows/check.yml)
 
 A ready-made **DHCP and DNS lab** for teaching how a network hands out addresses and answers names, from the [MitsuruTech Learning Platform](https://mitsurutech.co.uk/learning), where schools and colleges give every student their own Ubuntu VM with a terminal in the browser. Each student gets a small network built inside their machine: a server and two clients, `pc1` and `pc2`, that start with **no address at all**. The student configures **dnsmasq**, the small DHCP and DNS server found in home routers and labs everywhere, so that the server leases addresses from a range, tells the clients their router and DNS server, gives one client a **fixed address by its MAC address**, and answers for the lab's own names. Nothing is installed on the student's computer.
@@ -56,4 +58,6 @@ More labs from the same place: [lab-netlab](https://github.com/mitsurutech/lab-n
 
 ## Licence
 
-The lab definition, the `dnslab` tool and this documentation are MIT licensed, see [LICENSE](LICENSE): copy them, change them, teach with them. [dnsmasq](https://thekelleys.org.uk/dnsmasq/doc.html) is GPL-2.0 or GPL-3.0 licensed and the ISC DHCP client is MPL-2.0 licensed; both are installed from Ubuntu's archive when a VM starts, and nothing of them is distributed here.
+This work is licensed under [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/). You may share it and adapt it for learning and teaching, if you credit Mitsuru Technologies Ltd, do not use it commercially, and share anything you make from it under the same licence. The full text is in the `LICENSE` file.
+
+The applications this lab installs keep the licences of their own projects: [dnsmasq](https://thekelleys.org.uk/dnsmasq/doc.html) is GPL-2.0 or GPL-3.0 licensed and the ISC DHCP client is MPL-2.0 licensed; both are installed from Ubuntu's archive when a VM starts, and nothing of them is distributed here.
